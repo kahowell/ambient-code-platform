@@ -16,8 +16,6 @@ import {
   Cloud,
   FolderSync,
   Download,
-  LibraryBig,
-  MessageSquare,
   SlidersHorizontal,
   ArrowLeft,
 } from "lucide-react";
@@ -73,11 +71,12 @@ import { WorkflowsAccordion } from "./components/accordions/workflows-accordion"
 import { RepositoriesAccordion } from "./components/accordions/repositories-accordion";
 import { ArtifactsAccordion } from "./components/accordions/artifacts-accordion";
 import { McpIntegrationsAccordion } from "./components/accordions/mcp-integrations-accordion";
-
+import { WelcomeExperience } from "./components/welcome-experience";
 // Extracted hooks and utilities
 import { useGitOperations } from "./hooks/use-git-operations";
 import { useWorkflowManagement } from "./hooks/use-workflow-management";
 import { useFileOperations } from "./hooks/use-file-operations";
+import { useSessionQueue } from "@/hooks/use-session-queue";
 import type { DirectoryOption, DirectoryRemote } from "./lib/types";
 
 import type { MessageObject, ToolUseMessages, HierarchicalToolMessage } from "@/types/agentic-session";
@@ -150,12 +149,12 @@ export default function ProjectSessionDetailPage({
   const [sessionName, setSessionName] = useState<string>("");
   const [chatInput, setChatInput] = useState("");
   const [backHref, setBackHref] = useState<string | null>(null);
-  const [openAccordionItems, setOpenAccordionItems] = useState<string[]>(["workflows"]);
+  const [openAccordionItems, setOpenAccordionItems] = useState<string[]>([]);
   const [contextModalOpen, setContextModalOpen] = useState(false);
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
   const [repoChanging, setRepoChanging] = useState(false);
-  const [firstMessageLoaded, setFirstMessageLoaded] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [userHasInteracted, setUserHasInteracted] = useState(false);
 
   // Directory browser state (unified for artifacts, repos, and workflow)
   const [selectedDirectory, setSelectedDirectory] = useState<DirectoryOption>({
@@ -182,6 +181,9 @@ export default function ProjectSessionDetailPage({
       } catch {}
     });
   }, [params]);
+
+  // Session queue hook (localStorage-backed)
+  const sessionQueue = useSessionQueue(projectName, sessionName);
 
   // React Query hooks
   const {
@@ -256,8 +258,88 @@ export default function ProjectSessionDetailPage({
   const workflowManagement = useWorkflowManagement({
     projectName,
     sessionName,
+    sessionPhase: session?.status?.phase,
     onWorkflowActivated: refetchSession,
   });
+
+  // Poll session status when workflow is queued
+  useEffect(() => {
+    if (!workflowManagement.queuedWorkflow) return;
+    
+    const phase = session?.status?.phase;
+    
+    // If already running, we'll process workflow in the next effect
+    if (phase === "Running") return;
+    
+    // Poll every 2 seconds to check if session is ready
+    const pollInterval = setInterval(() => {
+      refetchSession();
+    }, 2000);
+    
+    return () => clearInterval(pollInterval);
+  }, [workflowManagement.queuedWorkflow, session?.status?.phase, refetchSession]);
+
+  // Process queued workflow when session becomes Running
+  useEffect(() => {
+    const phase = session?.status?.phase;
+    const queuedWorkflow = workflowManagement.queuedWorkflow;
+    if (phase === "Running" && queuedWorkflow && !queuedWorkflow.activatedAt) {
+      // Session is now running, activate the queued workflow
+      workflowManagement.activateWorkflow({
+        id: queuedWorkflow.id,
+        name: "Queued workflow",
+        description: "",
+        gitUrl: queuedWorkflow.gitUrl,
+        branch: queuedWorkflow.branch,
+        path: queuedWorkflow.path,
+        enabled: true,
+      }, phase);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.status?.phase, workflowManagement.queuedWorkflow]);
+
+  // Poll session status when messages are queued
+  useEffect(() => {
+    const queuedMessages = sessionQueue.messages.filter(m => !m.sentAt);
+    if (queuedMessages.length === 0) return;
+    
+    const phase = session?.status?.phase;
+    
+    // If already running, we'll process messages in the next effect
+    if (phase === "Running") return;
+    
+    // Poll every 2 seconds to check if session is ready
+    const pollInterval = setInterval(() => {
+      refetchSession();
+    }, 2000);
+    
+    return () => clearInterval(pollInterval);
+  }, [sessionQueue.messages, session?.status?.phase, refetchSession]);
+
+  // Process queued messages when session becomes Running
+  useEffect(() => {
+    const phase = session?.status?.phase;
+    const unsentMessages = sessionQueue.messages.filter(m => !m.sentAt);
+    
+    if (phase === "Running" && unsentMessages.length > 0) {
+      // Session is now running, send all queued messages
+      const processMessages = async () => {
+        for (const messageItem of unsentMessages) {
+          try {
+            await aguiSendMessage(messageItem.content);
+            sessionQueue.markMessageSent(messageItem.id);
+            // Small delay between messages to avoid overwhelming the system
+            await new Promise(resolve => setTimeout(resolve, 100));
+          } catch (err) {
+            errorToast(err instanceof Error ? err.message : "Failed to send queued message");
+          }
+        }
+      };
+      
+      processMessages();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.status?.phase, sessionQueue.messages.length]);
 
   // Repo management mutations
   const addRepoMutation = useMutation({
@@ -503,35 +585,17 @@ export default function ProjectSessionDetailPage({
 
   // Track if we've already initialized from session
   const initializedFromSessionRef = useRef(false);
+  const workflowLoadedFromSessionRef = useRef(false);
 
-  // Track when first message loads
-  useEffect(() => {
-    if (aguiState.messages && aguiState.messages.length > 0 && !firstMessageLoaded) {
-      setFirstMessageLoaded(true);
-    }
-  }, [aguiState.messages, firstMessageLoaded]);
+  // Note: userHasInteracted is only set when:
+  // 1. User explicitly selects a workflow (handleWelcomeWorkflowSelect -> onUserInteraction)
+  // 2. User sends a message (sendChat sets it to true)
+  // It should NOT be set automatically when backend messages arrive
 
-  // Load active workflow and remotes from session
+  // Load remotes from session annotations (one-time initialization)
   useEffect(() => {
     if (initializedFromSessionRef.current || !session) return;
 
-    if (session.spec?.activeWorkflow && ootbWorkflows.length === 0) {
-      return;
-    }
-
-    if (session.spec?.activeWorkflow) {
-      const gitUrl = session.spec.activeWorkflow.gitUrl;
-      const matchingWorkflow = ootbWorkflows.find((w) => w.gitUrl === gitUrl);
-      if (matchingWorkflow) {
-        workflowManagement.setActiveWorkflow(matchingWorkflow.id);
-        workflowManagement.setSelectedWorkflow(matchingWorkflow.id);
-      } else {
-        workflowManagement.setActiveWorkflow("custom");
-        workflowManagement.setSelectedWorkflow("custom");
-      }
-    }
-
-    // Load remotes from annotations
     const annotations = session.metadata?.annotations || {};
     const remotes: Record<string, DirectoryRemote> = {};
 
@@ -551,7 +615,7 @@ export default function ProjectSessionDetailPage({
 
     setDirectoryRemotes(remotes);
     initializedFromSessionRef.current = true;
-  }, [session, ootbWorkflows, workflowManagement]);
+  }, [session]);
 
   // Compute directory options
   const directoryOptions = useMemo<DirectoryOption[]>(() => {
@@ -589,9 +653,18 @@ export default function ProjectSessionDetailPage({
 
   // Workflow change handler
   const handleWorkflowChange = (value: string) => {
-    workflowManagement.handleWorkflowChange(value, ootbWorkflows, () =>
+    const workflow = workflowManagement.handleWorkflowChange(value, ootbWorkflows, () =>
       setCustomWorkflowDialogOpen(true),
     );
+    // Automatically trigger activation with the workflow directly (avoids state timing issues)
+    if (workflow) {
+      workflowManagement.activateWorkflow(workflow, session?.status?.phase);
+    }
+  };
+
+  // Handle workflow selection from welcome experience
+  const handleWelcomeWorkflowSelect = (workflowId: string) => {
+    handleWorkflowChange(workflowId);
   };
 
   // Convert AG-UI messages to display format with hierarchical tool call rendering
@@ -954,6 +1027,59 @@ export default function ProjectSessionDetailPage({
     aguiState.pendingChildren,   // CRITICAL: Include so UI updates when children finish
   ]);
 
+  // Check if there are any real messages (user or assistant messages, not just system)
+  const hasRealMessages = useMemo(() => {
+    return streamMessages.some(
+      (msg) => msg.type === "user_message" || msg.type === "agent_message"
+    );
+  }, [streamMessages]);
+
+  // Clear queued messages when first agent response arrives
+  useEffect(() => {
+    const sentMessages = sessionQueue.messages.filter(m => m.sentAt);
+    if (sentMessages.length > 0 && streamMessages.length > 0) {
+      // Check if there's at least one agent message (response to our queued messages)
+      const hasAgentResponse = streamMessages.some(
+        msg => msg.type === "agent_message" || msg.type === "tool_use_messages"
+      );
+      
+      if (hasAgentResponse) {
+        sessionQueue.clearMessages();
+      }
+    }
+  }, [sessionQueue, streamMessages]);
+
+  // Load workflow from session when session data and workflows are available
+  // Syncs the workflow panel with the workflow reported by the API
+  useEffect(() => {
+    if (workflowLoadedFromSessionRef.current || !session) return;
+    if (session.spec?.activeWorkflow && ootbWorkflows.length === 0) return;
+
+    // Sync workflow from session whenever it's set in the API
+    if (session.spec?.activeWorkflow) {
+      // Match by path (e.g., "workflows/spec-kit") - this uniquely identifies each OOTB workflow
+      // Don't match by gitUrl since all OOTB workflows share the same repo URL
+      const activePath = session.spec.activeWorkflow.path;
+      const matchingWorkflow = ootbWorkflows.find((w) => w.path === activePath);
+      if (matchingWorkflow) {
+        workflowManagement.setActiveWorkflow(matchingWorkflow.id);
+        workflowManagement.setSelectedWorkflow(matchingWorkflow.id);
+        // Mark as interacted for existing sessions with messages
+        if (hasRealMessages) {
+          setUserHasInteracted(true);
+        }
+      } else {
+        // No matching OOTB workflow found - treat as custom workflow
+        workflowManagement.setActiveWorkflow("custom");
+        workflowManagement.setSelectedWorkflow("custom");
+        if (hasRealMessages) {
+          setUserHasInteracted(true);
+        }
+      }
+      workflowLoadedFromSessionRef.current = true;
+    }
+  }, [session, ootbWorkflows, workflowManagement, hasRealMessages]);
+
   // Auto-refresh artifacts when messages complete
   // UX improvement: Automatically refresh the artifacts panel when Claude writes new files,
   // so users can see their changes immediately without manually clicking the refresh button
@@ -1024,7 +1150,6 @@ export default function ProjectSessionDetailPage({
       }
     };
   }, [session?.status?.phase, refetchArtifactsFiles]);
-
   // Session action handlers
   const handleStop = () => {
     stopMutation.mutate(
@@ -1085,6 +1210,18 @@ export default function ProjectSessionDetailPage({
 
     const finalMessage = chatInput.trim();
     setChatInput("");
+
+    // Mark user interaction when they send first message
+    setUserHasInteracted(true);
+
+    const phase = session?.status?.phase;
+    
+    // If session is not yet running, queue the message for later
+    // This includes: undefined (loading), "Pending", "Creating", or any other non-Running state
+    if (!phase || phase !== "Running") {
+      sessionQueue.addMessage(finalMessage);
+      return;
+    }
 
     try {
       await aguiSendMessage(finalMessage);
@@ -1297,25 +1434,7 @@ export default function ProjectSessionDetailPage({
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
-                {/* Blocking overlay when first message hasn't loaded and session is pending */}
-                {!firstMessageLoaded &&
-                  session?.status?.phase === "Pending" && (
-                    <div className="absolute inset-0 bg-background/60 backdrop-blur-sm rounded-lg z-20 flex items-center justify-center">
-                      <div className="flex flex-col items-center justify-center text-center text-muted-foreground">
-                        <LibraryBig className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                        <div className="flex items-center gap-2">
-                          <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
-                          <p className="text-sm">No context yet</p>
-                        </div>
-                        <p className="text-xs mt-1">
-                          Context will appear once the session starts...
-                        </p>
-                      </div>
-                    </div>
-                  )}
-                <div
-                  className={`flex-grow pb-6 ${!firstMessageLoaded && session?.status?.phase === "Pending" ? "pointer-events-none opacity-50" : ""}`}
-                >
+                <div className="flex-grow pb-6">
                   <Accordion
                     type="multiple"
                     value={openAccordionItems}
@@ -1326,12 +1445,10 @@ export default function ProjectSessionDetailPage({
                       sessionPhase={session?.status?.phase}
                       activeWorkflow={workflowManagement.activeWorkflow}
                       selectedWorkflow={workflowManagement.selectedWorkflow}
-                      pendingWorkflow={workflowManagement.pendingWorkflow}
                       workflowActivating={workflowManagement.workflowActivating}
                       ootbWorkflows={ootbWorkflows}
                       isExpanded={openAccordionItems.includes("workflows")}
                       onWorkflowChange={handleWorkflowChange}
-                      onActivateWorkflow={workflowManagement.activateWorkflow}
                       onResume={handleContinue}
                     />
 
@@ -1761,21 +1878,6 @@ export default function ProjectSessionDetailPage({
               <div className="flex-1 min-w-0 flex flex-col">
                 <Card className="relative flex-1 flex flex-col overflow-hidden py-0 border-0 rounded-none md:border-l">
                   <CardContent className="px-3 pt-0 pb-0 flex-1 flex flex-col overflow-hidden">
-                    {/* Workflow activation overlay */}
-                    {workflowManagement.workflowActivating && (
-                      <div className="absolute inset-0 bg-background/90 backdrop-blur-sm z-10 flex items-center justify-center rounded-lg">
-                        <Alert className="max-w-md mx-4">
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                          <AlertTitle>Activating Workflow...</AlertTitle>
-                          <AlertDescription>
-                            <p>
-                              The new workflow is being loaded. Please wait...
-                            </p>
-                          </AlertDescription>
-                        </Alert>
-                      </div>
-                    )}
-
                     {/* Repository change overlay */}
                     {repoChanging && (
                       <div className="absolute inset-0 bg-background/90 backdrop-blur-sm z-10 flex items-center justify-center rounded-lg">
@@ -1794,26 +1896,7 @@ export default function ProjectSessionDetailPage({
                       </div>
                     )}
 
-                    {/* Session starting overlay */}
-                    {!firstMessageLoaded &&
-                      session?.status?.phase === "Pending" && (
-                        <div className="absolute inset-0 bg-background/60 backdrop-blur-sm rounded-lg z-20 flex items-center justify-center">
-                          <div className="flex flex-col items-center justify-center text-center text-muted-foreground">
-                            <MessageSquare className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                            <div className="flex items-center gap-2">
-                              <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
-                              <p className="text-sm">No messages yet</p>
-                            </div>
-                            <p className="text-xs mt-1">
-                              Messages will appear once the session starts...
-                            </p>
-                          </div>
-                        </div>
-                      )}
-
-                    <div
-                      className={`flex flex-col flex-1 overflow-hidden ${!firstMessageLoaded && session?.status?.phase === "Pending" ? "pointer-events-none opacity-50" : ""}`}
-                    >
+                    <div className="flex flex-col flex-1 overflow-hidden">
                       <MessagesTab
                         session={session}
                         streamMessages={streamMessages}
@@ -1827,6 +1910,23 @@ export default function ProjectSessionDetailPage({
                         workflowMetadata={workflowMetadata}
                         onCommandClick={handleCommandClick}
                         isRunActive={isRunActive}
+                        showWelcomeExperience={true}
+                        activeWorkflow={workflowManagement.activeWorkflow}
+                        userHasInteracted={userHasInteracted}
+                        queuedMessages={sessionQueue.messages}
+                        hasRealMessages={hasRealMessages}
+                        welcomeExperienceComponent={
+                          <WelcomeExperience
+                            ootbWorkflows={ootbWorkflows}
+                            onWorkflowSelect={handleWelcomeWorkflowSelect}
+                            onUserInteraction={() => setUserHasInteracted(true)}
+                            userHasInteracted={userHasInteracted}
+                            sessionPhase={session?.status?.phase}
+                            hasRealMessages={hasRealMessages}
+                            onLoadWorkflow={() => setCustomWorkflowDialogOpen(true)}
+                            selectedWorkflow={workflowManagement.selectedWorkflow}
+                          />
+                        }
                       />
                     </div>
                   </CardContent>
