@@ -6,7 +6,7 @@ metadata:
 
 # Resources (base + mpp-specific)
 resources:
-- ../../production
+- ../production
 
 # Patches for mpp
 patches:
