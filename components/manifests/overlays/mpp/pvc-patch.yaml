@@ -3,5 +3,6 @@ kind: PersistentVolumeClaim
 metadata:
   annotations:
     kubernetes.io/reclaimPolicy: Delete
+  name: placeholder
 spec:
   storageClassName: aws-ebs
