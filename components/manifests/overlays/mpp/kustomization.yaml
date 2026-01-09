@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: ambient-code-mpp
+
+# Resources (base + mpp-specific)
+resources:
+- ../../base
+
+# Patches for mpp
+patches:
+- path: pvc-patch.yaml
+  target:
+    kind: PersistentVolumeClaim
